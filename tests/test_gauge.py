@@ -395,6 +395,128 @@ class PretendCouchDB(BaseHTTPRequestHandler):
         error = {'error':'not_found', 'reason': 'Database does not exist.'}
         self._set_up_response(404, error)
 
+class GaugeWatcherTest(unittest.TestCase):
+    """ Checks the loggers in watcher.py"""
+
+    def setUp(self):
+        """Creates a temporary file and a mocked conf object"""
+        self.temp_fd, self.temp_path = tempfile.mkstemp()
+        self.conf = mock.Mock(file=self.temp_path)
+
+    def tearDown(self):
+        """Closes and deletes the temporary file"""
+        os.close(self.temp_fd)
+        os.remove(self.temp_path)
+
+    def get_file_contents(self):
+        """Return the contents of the temporary file and clear it"""
+        with open(self.temp_path, 'r+') as file_:
+            contents = file_.read()
+            file_.seek(0, 0)
+            file_.truncate()
+
+        return contents
+
+    def test_port_state(self):
+        """Check the update method in the GaugePortStateLogger class"""
+
+        logger = watcher.GaugePortStateLogger(self.conf, '__name__', mock.Mock())
+        reasons = {'unknown' : 5,
+                   'add' : ofproto.OFPPR_ADD,
+                   'delete' : ofproto.OFPPR_DELETE,
+                   'up' : ofproto.OFPPR_MODIFY,
+                   'down' : ofproto.OFPPR_MODIFY
+                  }
+
+        #add an ofproto attribute to the datapath
+        datapath = create_mock_datapath(1)
+        ofp_attr = {'ofproto': ofproto}
+        datapath.configure_mock(**ofp_attr)
+
+        for reason in reasons:
+            state = 0
+            if reason == 'down':
+                state = ofproto.OFPPS_LINK_DOWN
+
+            msg = port_state_msg(datapath, 1, reasons[reason], state)
+            logger.update(time.time(), datapath.dp_id, msg)
+
+            log_str = self.get_file_contents().lower()
+            self.assertTrue(reason in log_str)
+            self.assertTrue(msg.desc.name in log_str or 'port ' + str(msg.desc.port_no) in log_str)
+
+            hexs = re.findall(r'0x[0-9A-Fa-f]+', log_str)
+            hexs = [int(num, 16) for num in hexs]
+            self.assertTrue(datapath.dp_id in hexs or str(datapath.dp_id) in log_str)
+
+    def test_port_stats(self):
+        """Check the update method in the GaugePortStatsLogger class"""
+
+        #add an ofproto attribute to the datapath
+        datapath = create_mock_datapath(2)
+        ofp_attr = {'ofproto': ofproto}
+        datapath.configure_mock(**ofp_attr)
+
+        #add the datapath as an attribute to the config
+        dp_attr = {'dp' : datapath}
+        self.conf.configure_mock(**dp_attr)
+
+        logger = watcher.GaugePortStatsLogger(self.conf, '__name__', mock.Mock())
+        msg = port_stats_msg(datapath)
+
+        original_stats = []
+        for i in range(0, len(msg.body)):
+            original_stats.append(logger_to_ofp(msg.body[i]))
+
+        logger.update(time.time(), datapath.dp_id, msg)
+
+        log_str = self.get_file_contents()
+        for stat_name in original_stats[0]:
+            stat_name = stat_name.split("_")
+            #grab any lines that mention the stat_name
+            pattern = r'^.*{}.{}.*$'.format(stat_name[0], stat_name[1])
+            stats_list = re.findall(pattern, log_str, re.MULTILINE)
+
+            for line in stats_list:
+                self.assertTrue(datapath.name in line)
+                #grab the port number (only works for single digit port nums)
+                index = line.find('port')
+                port_num = int(line[index + 4])
+
+                #grab the number at the end of the line
+                val = int(re.search(r'(\d+)$', line).group())
+                logger_stat_name = '_'.join((stat_name[0], stat_name[1]))
+                original_val = original_stats[port_num - 1][logger_stat_name]
+                self.assertEqual(original_val, val)
+
+    def test_flow_stats(self):
+        """Check the update method in the GaugeFlowStatsLogger class"""
+
+        #add an ofproto attribute to the datapath
+        datapath = create_mock_datapath(0)
+        ofp_attr = {'ofproto': ofproto}
+        datapath.configure_mock(**ofp_attr)
+
+        #add the datapath as an attribute to the config
+        dp_attr = {'dp' : datapath}
+        self.conf.configure_mock(**dp_attr)
+
+        logger = watcher.GaugeFlowTableLogger(self.conf, '__name__', mock.Mock())
+        instructions = [parser.OFPInstructionGotoTable(1)]
+
+        msg = flow_stats_msg(datapath, instructions)
+        logger.update(time.time(), datapath.dp_id, msg)
+        log_str = self.get_file_contents()
+
+        #only parse the message part of the log text
+        str_to_find = "msg: "
+        index = log_str.find(str_to_find)
+        #discard the start of the log text
+        log_str = log_str[index + len(str_to_find):]
+        json_dict = json.loads(log_str)['OFPFlowStatsReply']['body'][0]['OFPFlowStats']
+
+        compare_flow_msg(msg, json_dict, self)
+
 class GaugePrometheusTests(unittest.TestCase):
     """Tests the GaugePortStatsPrometheusPoller update method"""
 
@@ -1027,161 +1149,107 @@ class GaugeDatabaseCouchTest(unittest.TestCase):
         self.assertEqual(1, len(self.server.docs))
         self.assertEqual(self.server.docs['test_db/_design/test_view']['views'], view)
 
-class GaugeNsODBCTest(unittest.TestCase):
-    """ Tests for the GaugeNsODBC helper class in gauge_nsodbc"""
+class GaugeThreadPollerTest(unittest.TestCase):
+    """Tests the methods in the GaugeThreadPoller class"""
 
     def setUp(self):
-        """
-        Start up the pretend couchdb server
-        and create a config object
-        """
-        self.server = start_server(PretendCouchDB)
-        self.server.db = set()
-        self.server.docs = dict()
-        self.couch = gauge_nsodbc.GaugeNsODBC()
-        datapath = create_mock_datapath(0)
-        self.conf = mock.Mock(dp=datapath,
-                              driver='couchdb',
-                              db_ip='127.0.0.1',
-                              db_port=self.server.server_port,
-                              db_username='couch',
-                              db_password='123',
-                              switches_doc='switches_bak',
-                              flows_doc='flows_bak',
-                              db_update_counter=2,
-                              nosql_db='couch',
-                              views={
-                                  'switch_view': '_design/switches/_view/switch',
-                                  'match_view': '_design/flows/_view/match',
-                                  }
-                             )
-        self.couch.conf = self.conf
-        self.credentials = {'driver': self.conf.driver,
-                            'uid': self.conf.db_username,
-                            'pwd': self.conf.db_password,
-                            'server': self.conf.db_ip,
-                            'port': self.conf.db_port}
+        """Creates a gauge poller and initialises class variables"""
+        self.interval = 1
+        conf = mock.Mock(interval=self.interval)
+        self.poller = gauge_pollers.GaugeThreadPoller(conf, '__name__', mock.Mock())
+        self.send_called = False
 
-    def tearDown(self):
-        """ Shutdown pretend server """
-        self.server.shutdown()
+    def fake_send_req(self):
+        """This should be called instead of the send_req method in the
+        GaugeThreadPoller class, which just throws an error"""
+        self.send_called = True
 
-    def get_doc_name(self, db_name, view_name):
-        """ Creates a string that corresponds to the view's doc name in the server """
-        view = self.conf.views[view_name]
-        doc_name = re.search(r'_design/(.*)/_view', view).group(1)
-        return db_name + '/_design/' + doc_name
+    def fake_no_response(self):
+        """This should be called instead of the no_response method in the
+        GaugeThreadPoller class, which just throws an error"""
+        pass
 
-    def test_setup(self):
-        """Check that the setup method creates new databases and views"""
-        self.couch.setup()
-        self.assertTrue(self.conf.switches_doc in self.server.db)
-        self.assertTrue(self.conf.flows_doc in self.server.db)
+    def test_start(self):
+        """ Checks if the poller is started """
+        self.poller.send_req = self.fake_send_req
+        self.poller.no_response = self.fake_no_response
 
-        switch_doc = self.get_doc_name(self.conf.switches_doc, 'switch_view')
-        self.assertTrue(switch_doc in self.server.docs)
-        flow_doc = self.get_doc_name(self.conf.flows_doc, 'match_view')
-        self.assertTrue(flow_doc in self.server.docs)
+        self.poller.start(mock.Mock())
+        poller_thread = self.poller.thread
+        hub.sleep(self.interval + 1)
+        self.assertTrue(self.send_called)
+        self.assertFalse(poller_thread.dead)
 
-    def test_setup_existing(self):
-        """
-        Check that setup does not try to create new databases
-        when there are existing ones.
-        """
-        self.server.db.add(self.conf.switches_doc)
-        self.server.db.add(self.conf.flows_doc)
-        self.couch.setup()
-        self.assertEqual(len(self.server.db), 2)
-        self.assertFalse(self.server.docs)
+    def test_stop(self):
+        """ Check if a poller can be stopped """
+        self.poller.send_req = self.fake_send_req
+        self.poller.no_response = self.fake_no_response
 
-    def test_refresh_switch(self):
-        """
-        Check that it refreshes the data related to the switch
-        by deleting the existing switch database, replacing it
-        with a new one.
-        """
-        g_db = nsodbc.nsodbc_factory()
-        self.couch.conn = g_db.connect(**self.credentials)
+        self.poller.start(mock.Mock())
+        poller_thread = self.poller.thread
+        self.poller.stop()
+        hub.sleep(self.interval + 1)
 
-        self.server.db.add(self.conf.switches_doc)
-        test_file = self.conf.switches_doc + '/test_file'
-        self.server.docs[test_file] = {'key1' : 'val1'}
-        self.couch.refresh_switchdb()
+        self.assertFalse(self.send_called)
+        self.assertTrue(poller_thread.dead)
 
-        switch_doc = self.get_doc_name(self.conf.switches_doc, 'switch_view')
-        self.assertTrue(switch_doc in self.server.docs)
-        self.assertFalse(test_file in self.server.docs)
-        self.assertTrue(self.conf.switches_doc in self.server.db)
+    def test_running(self):
+        """ Check if running reflects the state of the poller """
+        self.assertFalse(self.poller.running())
+        self.poller.start(mock.Mock())
+        self.assertTrue(self.poller.running())
+        self.poller.stop()
+        self.assertFalse(self.poller.running())
 
-    def test_refresh_flow(self):
-        """
-        Check that it refreshes the data related to the flows
-        by deleting the existing flow database, and replacing it
-        with a new one.
-        """
-        g_db = nsodbc.nsodbc_factory()
-        self.couch.conn = g_db.connect(**self.credentials)
+class GaugePollerTest(unittest.TestCase):
+    """Checks the send_req and no_response methods in a Gauge Poller"""
 
-        self.server.db.add(self.conf.flows_doc)
-        test_file = self.conf.flows_doc + '/test_file'
-        self.server.docs[test_file] = {'key1' : 'val1'}
-        self.couch.refresh_flowdb()
+    def check_send_req(self, poller, msg_class):
+        """Check that the message being sent matches the expected one"""
+        datapath = mock.Mock(ofproto=ofproto, ofproto_parser=parser)
+        poller.start(datapath)
+        poller.stop()
+        poller.send_req()
+        for method_call in datapath.mock_calls:
+            arg = method_call[1][0]
+            self.assertTrue(isinstance(arg, msg_class))
 
-        flow_doc = self.get_doc_name(self.conf.flows_doc, 'match_view')
-        self.assertTrue(flow_doc in self.server.docs)
-        self.assertFalse(test_file in self.server.docs)
-        self.assertTrue(self.conf.flows_doc in self.server.db)
+    def check_no_response(self, poller):
+        """Check that no exception occurs when the no_response method is called"""
+        try:
+            poller.no_response()
+        except Exception as err:
+            self.fail("Code threw an exception: {}".format(err))
 
-class GaugeNsodbcPollerTest(unittest.TestCase):
-    """Checks the update method of GaugeNsodbcPoller"""
+class GaugePortStatsPollerTest(GaugePollerTest):
+    """Checks the GaugePortStatsPoller class"""
 
-    def setUp(self):
-        """
-        Start up the pretend couchdb server
-        and create a config object
-        """
-        self.server = start_server(PretendCouchDB)
-        self.server.db = set()
-        self.server.docs = dict()
-        datapath = create_mock_datapath(1)
-        self.conf = mock.Mock(dp=datapath,
-                              driver='couchdb',
-                              db_ip='127.0.0.1',
-                              db_port=self.server.server_port,
-                              db_username='couch',
-                              db_password='123',
-                              switches_doc='switches_bak',
-                              flows_doc='flows_bak',
-                              db_update_counter=2,
-                              nosql_db='couch',
-                              views={
-                                  'switch_view': '_design/switches/_view/switch',
-                                  'match_view': '_design/flows/_view/match',
-                                  }
-                             )
+    def test_send_req(self):
+        """Check that the poller sends a port stats request"""
+        conf = mock.Mock(interval=1)
+        poller = gauge_pollers.GaugePortStatsPoller(conf, '__name__', mock.Mock())
+        self.check_send_req(poller, parser.OFPPortStatsRequest)
 
-    def tearDown(self):
-        """ Shutdown pretend server """
-        self.server.shutdown()
+    def test_no_response(self):
+        """Check that the poller doesnt throw an exception"""
+        poller = gauge_pollers.GaugePortStatsPoller(mock.Mock(), '__name__', mock.Mock())
+        self.check_no_response(poller)
 
-    def test_update(self):
-        """Compares the data writtten to the CouchDB server and the original flow message"""
-        db_logger = gauge_nsodbc.GaugeFlowTableDBLogger(self.conf, '__name__', mock.Mock())
-        rcv_time = int(time.time())
-        instructions = [parser.OFPInstructionGotoTable(1)]
-        msg = flow_stats_msg(self.conf.dp, instructions)
-        db_logger.update(rcv_time, self.conf.dp.dp_id, msg)
+class GaugeFlowTablePollerTest(GaugePollerTest):
+    """Checks the GaugeFlowTablePoller class"""
 
-        for doc in self.server.docs:
-            if doc.startswith(self.conf.flows_doc) and '_design' not in doc:
-                flow_doc = self.server.docs[doc]
-            elif doc.startswith(self.conf.switches_doc) and '_design' not in doc:
-                switch_doc = self.server.docs[doc]
+    def test_send_req(self):
+        """Check that the poller sends a flow stats request"""
+        conf = mock.Mock(interval=1)
+        poller = gauge_pollers.GaugeFlowTablePoller(conf, '__name__', mock.Mock())
+        self.check_send_req(poller, parser.OFPFlowStatsRequest)
 
-        self.assertEqual(switch_doc['data']['flows'][0], flow_doc['_id'])
-        flow_doc = flow_doc['data']['OFPFlowStats']
 
-        compare_flow_msg(msg, flow_doc, self)
+    def test_no_response(self):
+        """Check that the poller doesnt throw an exception"""
+        poller = gauge_pollers.GaugeFlowTablePoller(mock.Mock(), '__name__', mock.Mock())
+        self.check_no_response(poller)
+
 
 if __name__ == "__main__":
     unittest.main()
