@@ -1,14 +1,5 @@
 """Unit tests for gauge"""
 
-try:
-    # Python 2
-    from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
-    import mock
-except ImportError:
-    # Python 3
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    from unittest import mock
-import unittest
 import time
 import threading
 import tempfile
@@ -19,6 +10,9 @@ import random
 import urllib
 import requests
 import couchdb
+import unittest
+from unittest import mock
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from faucet import gauge_prom, gauge_influx, gauge_pollers, watcher, nsodbc, gauge_nsodbc
 from ryu.ofproto import ofproto_v1_3 as ofproto
